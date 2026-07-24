@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DemoGen - AI-Powered Demo Videos</title>
+    <link rel="stylesheet" href="/static/css/styles.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <h1 class="logo">
+                    <span class="logo-icon">▶</span>
+                    DemoGen
+                </h1>
+                <p class="tagline">AI-Powered Demo Video Generator</p>
+            </div>
+        </header>
+
+        <main class="main-content">
+            <!-- Sidebar Navigation -->
+            <nav class="sidebar">
+                <ul class="nav-menu">
+                    <li class="nav-item active" data-tab="generator">
+                        <span class="nav-icon">✨</span>
+                        <span class="nav-text">Generator</span>
+                    </li>
+                    <li class="nav-item" data-tab="templates">
+                        <span class="nav-icon">📋</span>
+                        <span class="nav-text">Templates</span>
+                    </li>
+                    <li class="nav-item" data-tab="history">
+                        <span class="nav-icon">📺</span>
+                        <span class="nav-text">History</span>
+                    </li>
+                    <li class="nav-item" data-tab="settings">
+                        <span class="nav-icon">⚙️</span>
+                        <span class="nav-text">Settings</span>
+                    </li>
+                </ul>
+            </nav>
+
+            <!-- Content Area -->
+            <section class="content">
+                <!-- Generator Tab -->
+                <div class="tab-content active" id="generator">
+                    <div class="card">
+                        <h2>Create New Demo</h2>
+                        
+                        <form id="demoForm" class="form-container">
+                            <!-- Target URL Input -->
+                            <div class="form-group">
+                                <label for="targetUrl" class="form-label">Target Website URL</label>
+                                <input
+                                    type="url"
+                                    id="targetUrl"
+                                    class="form-input"
+                                    placeholder="https://example.com"
+                                    required
+                                >
+                                <span class="form-hint">Enter the full URL of the site to demo (include https://)</span>
+                            </div>
+
+                            <!-- Prompt Input -->
+                            <div class="form-group">
+                                <label for="prompt" class="form-label">What would you like to demo?</label>
+                                <textarea 
+                                    id="prompt" 
+                                    class="form-input textarea" 
+                                    placeholder="E.g., 'Show how to deploy a GPU instance on NeevCloud' or 'Demonstrate the AI inference API setup'"
+                                    rows="4"
+                                    required
+                                ></textarea>
+                                <span class="form-hint">Describe the feature or workflow you want to demonstrate</span>
+                            </div>
+
+                            <!-- Language Selection -->
+                            <div class="form-row">
+                                <div class="form-group">
+                                    <label for="language" class="form-label">Narration Language</label>
+                                    <select id="language" class="form-input select">
+                                        <option value="en">English</option>
+                                        <option value="es">Spanish</option>
+                                        <option value="fr">French</option>
+                                        <option value="de">German</option>
+                                        <option value="ja">Japanese</option>
+                                        <option value="zh">Chinese</option>
+                                    </select>
+                                </div>
+
+                                <!-- Feature Selection -->
+                                <div class="form-group">
+                                    <label for="feature" class="form-label">Feature/Portal Section</label>
+                                    <select id="feature" class="form-input select">
+                                        <option value="">Auto-detect</option>
+                                        <option value="gpu-deployment">GPU Deployment</option>
+                                        <option value="ai-inference">AI Inference</option>
+                                        <option value="storage-setup">Storage Setup</option>
+                                        <option value="networking">Networking</option>
+                                        <option value="monitoring">Monitoring</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            <!-- Advanced Options -->
+                            <details class="advanced-options">
+                                <summary class="summary-header">Advanced Options</summary>
+                                <div class="options-content">
+                                    <div class="form-group">
+                                        <label for="videoQuality" class="form-label">Video Quality</label>
+                                        <select id="videoQuality" class="form-input select">
+                                            <option value="high">High (1080p)</option>
+                                            <option value="medium" selected>Medium (720p)</option>
+                                            <option value="low">Low (480p)</option>
+                                        </select>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label class="checkbox-label">
+                                            <input type="checkbox" id="highlightClicks" checked>
+                                            <span>Highlight mouse clicks</span>
+                                        </label>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label class="checkbox-label">
+                                            <input type="checkbox" id="slowMotion">
+                                            <span>Slow motion narration</span>
+                                        </label>
+                                    </div>
+                                </div>
+                            </details>
+
+                            <!-- Action Buttons -->
+                            <div class="form-actions">
+                                <button type="submit" class="btn btn-primary">Generate Demo</button>
+                                <button type="reset" class="btn btn-secondary">Clear</button>
+                            </div>
+                        </form>
+                    </div>
+
+                    <!-- Status Card -->
+                    <div class="status-container" id="statusContainer" style="display: none;">
+                        <div class="card status-card">
+                            <div class="status-header">
+                                <h3>Generation Status</h3>
+                                <span class="status-badge" id="statusBadge">Processing...</span>
+                            </div>
+
+                            <div class="progress-container">
+                                <div class="progress-bar">
+                                    <div class="progress-fill" id="progressFill"></div>
+                                </div>
+                                <p class="progress-text" id="progressText">Starting automation...</p>
+                            </div>
+
+                            <div class="status-details">
+                                <div class="detail-item">
+                                    <span class="detail-label">Automation:</span>
+                                    <span class="detail-value" id="automationStatus">-</span>
+                                </div>
+                                <div class="detail-item">
+                                    <span class="detail-label">Narration:</span>
+                                    <span class="detail-value" id="narrationStatus">-</span>
+                                </div>
+                                <div class="detail-item">
+                                    <span class="detail-label">Video Composition:</span>
+                                    <span class="detail-value" id="videoStatus">-</span>
+                                </div>
+                                <div class="detail-item">
+                                    <span class="detail-label">Validation:</span>
+                                    <span class="detail-value" id="validationStatus">-</span>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Result Card -->
+                    <div class="result-container" id="resultContainer" style="display: none;">
+                        <div class="card result-card">
+                            <h3>Demo Ready! 🎉</h3>
+                            
+                            <div class="video-preview">
+                                <video id="videoPreview" controls>
+                                    <source id="videoSource" type="video/mp4">
+                                    Your browser does not support the video tag.
+                                </video>
+                            </div>
+
+                            <div class="video-info">
+                                <div class="info-row">
+                                    <span class="info-label">Duration:</span>
+                                    <span class="info-value" id="videoDuration">-</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Resolution:</span>
+                                    <span class="info-value" id="videoResolution">1080p</span>
+                                </div>
+                                <div class="info-row">
+                                    <span class="info-label">Quality Score:</span>
+                                    <span class="info-value" id="qualityScore">-</span>
+                                </div>
+                            </div>
+
+                            <div class="result-actions">
+                                <button class="btn btn-primary" onclick="downloadVideo()">Download Video</button>
+                                <button class="btn btn-secondary" onclick="shareVideo()">Share</button>
+                                <button class="btn btn-tertiary" onclick="regenerateDemo()">Regenerate</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Templates Tab -->
+                <div class="tab-content" id="templates">
+                    <div class="card">
+                        <h2>Demo Templates</h2>
+                        <div class="templates-grid" id="templatesGrid">
+                            <!-- Templates will be loaded here -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- History Tab -->
+                <div class="tab-content" id="history">
+                    <div class="card">
+                        <h2>Generation History</h2>
+                        <div class="history-list" id="historyList">
+                            <!-- History items will be loaded here -->
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Settings Tab -->
+                <div class="tab-content" id="settings">
+                    <div class="card">
+                        <h2>Settings</h2>
+                        <div class="settings-form">
+                            <div class="form-group">
+                                <label class="form-label">Default Language</label>
+                                <select class="form-input select">
+                                    <option>English</option>
+                                    <option>Spanish</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label class="form-label">Default Quality</label>
+                                <select class="form-input select">
+                                    <option>High (1080p)</option>
+                                    <option>Medium (720p)</option>
+                                </select>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/js/api.js"></script>
+    <script src="/static/js/app.js"></script>
+</body>
+</html>
