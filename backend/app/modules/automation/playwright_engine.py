@@ -13,7 +13,10 @@ so the pipeline can branch on ``status`` without inspecting exceptions.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -24,6 +27,69 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
+
+
+def _describe_exc(exc: BaseException) -> str:
+    """Format an exception for a log line, tolerating an empty message.
+
+    ``NotImplementedError()`` stringifies to ``""``, which used to produce
+    "Could not start Playwright: " -- a log line that ended at the colon and
+    named neither the cause nor the exception type.
+    """
+    text = str(exc).strip()
+    return f"{type(exc).__name__}: {text}" if text else type(exc).__name__
+
+
+# ----------------------------------------------------------------------
+# Windows event-loop policy
+# ----------------------------------------------------------------------
+# Playwright's sync API launches its Node driver with
+# asyncio.create_subprocess_exec, on a loop it builds itself with
+# asyncio.new_event_loop() -- so it inherits the process-wide event loop
+# *policy* whether we like it or not.
+#
+# On Windows only ProactorEventLoop implements subprocesses. SelectorEventLoop
+# inherits BaseEventLoop._make_subprocess_transport, which raises a bare
+# NotImplementedError with no message.
+#
+# uvicorn installs WindowsSelectorEventLoopPolicy process-wide whenever it
+# needs a subprocess of its own -- that is, with reload enabled or
+# workers > 1 (see uvicorn/loops/asyncio.py). So merely turning on auto-reload
+# was enough to make every single browser launch fail, while the same code
+# worked fine when run standalone. Re-assert Proactor immediately before we
+# need it.
+#
+# Changing the policy does not disturb a loop that already exists, so
+# uvicorn's running server loop is unaffected; only loops created afterwards
+# (i.e. Playwright's) see the new policy.
+_POLICY_LOCK = threading.Lock()
+
+
+def _ensure_subprocess_capable_loop_policy() -> None:
+    """On Windows, make ``asyncio.new_event_loop()`` able to spawn subprocesses."""
+    if sys.platform != "win32":
+        return
+
+    proactor_policy = getattr(asyncio, "WindowsProactorEventLoopPolicy", None)
+    if proactor_policy is None:  # pragma: no cover - not Windows
+        return
+
+    with _POLICY_LOCK:
+        try:
+            current = asyncio.get_event_loop_policy()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Could not read the event loop policy: %s", _describe_exc(exc))
+            return
+
+        if isinstance(current, proactor_policy):
+            return
+
+        asyncio.set_event_loop_policy(proactor_policy())
+        logger.warning(
+            "Swapped asyncio event loop policy %s -> WindowsProactorEventLoopPolicy; "
+            "the previous policy cannot spawn the Playwright driver process.",
+            type(current).__name__,
+        )
 
 # Only real web traffic. Blocks file://, chrome://, view-source:, data: and
 # friends, which an LLM-authored plan can otherwise talk us into opening.
@@ -73,6 +139,9 @@ class PlaywrightEngine:
         self.logs: List[Dict] = []
         self._video_dir: Optional[Path] = None
         self._recorded_video_path: Optional[str] = None
+        # Set whenever launch_browser() returns False, so callers can report
+        # *why* instead of a bare "Browser launch failed".
+        self.launch_error: Optional[str] = None
 
     # ------------------------------------------------------------------
     # logging helper
@@ -91,10 +160,25 @@ class PlaywrightEngine:
     # ------------------------------------------------------------------
     def launch_browser(self) -> bool:
         """Start Playwright and launch Chromium. Returns False on failure."""
+        self.launch_error = None
+        _ensure_subprocess_capable_loop_policy()
+
         try:
             self.playwright = sync_playwright().start()
+        except NotImplementedError as exc:
+            # Only reachable if the policy repair above could not be applied.
+            self.launch_error = (
+                "This asyncio event loop cannot spawn subprocesses, so the "
+                "Playwright driver could not be started "
+                f"({_describe_exc(exc)}). On Windows that means a "
+                "SelectorEventLoop: start the server without reload "
+                "(API_RELOAD=false) or install WindowsProactorEventLoopPolicy."
+            )
+            logger.error("Could not start Playwright: %s", self.launch_error)
+            return False
         except Exception as exc:
-            logger.error("Could not start Playwright: %s", exc)
+            self.launch_error = f"Could not start Playwright ({_describe_exc(exc)})"
+            logger.error("%s", self.launch_error)
             return False
 
         launch_kwargs = {
@@ -122,7 +206,8 @@ class PlaywrightEngine:
             )
             return True
         except Exception as exc:
-            logger.error("Failed to launch Chromium: %s", exc)
+            self.launch_error = f"Chromium failed to launch ({_describe_exc(exc)})"
+            logger.error("%s", self.launch_error)
             # Do not leak the driver process if launch failed.
             self._stop_playwright()
             return False

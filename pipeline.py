@@ -356,7 +356,14 @@ class DemoGenerationPipeline:
             action_exec_start = time.time()
             
             if not engine.launch_browser():
-                return {"success": False, "error": "Browser launch failed"}
+                # Surface the real cause. This used to return a bare "Browser
+                # launch failed", which reached the browser alert with no hint
+                # of whether the problem was a missing binary, a bad path, or
+                # an event loop that cannot spawn subprocesses.
+                return {
+                    "success": False,
+                    "error": engine.launch_error or "Browser launch failed",
+                }
             
             if not engine.create_context(video_dir=str(automation_dir)):
                 engine.close()

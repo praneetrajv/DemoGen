@@ -1,0 +1,52 @@
+# Normalize line endings.
+#
+# Why this file exists: the initial commit stored every source file with LF,
+# then Windows editors rewrote them as CRLF while core.autocrlf was unset. The
+# result was that `git status` reported all ~40 files as modified even when
+# nothing had actually changed, which makes real diffs impossible to review.
+#
+# `text=auto eol=lf` means: store LF in the repository, and check out LF on
+# every platform. Modern Windows editors (VS Code, Notepad, PyCharm) all handle
+# LF fine, so this is the least surprising option.
+#
+# One-time cleanup after adding this file:
+#     git add --renormalize .
+#     git commit -m "Normalize line endings to LF"
+
+* text=auto eol=lf
+
+# Explicit, so nothing depends on content sniffing.
+*.py    text eol=lf
+*.js    text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.env   text eol=lf
+.env.example text eol=lf
+Dockerfile   text eol=lf
+requirements.txt text eol=lf
+
+# Windows-only scripts must keep CRLF or cmd.exe mis-parses them.
+*.bat   text eol=crlf
+*.cmd   text eol=crlf
+*.ps1   text eol=crlf
+
+# Never touch binaries.
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.mp4   binary
+*.webm  binary
+*.mp3   binary
+*.wav   binary
+*.zip   binary
+*.pdf   binary
+*.woff  binary
+*.woff2 binary
+*.ttf   binary

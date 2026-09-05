@@ -93,13 +93,40 @@ async def http_exception_handler(request, exc):
 
 
 if __name__ == "__main__":
+    import os
+
     import uvicorn
-    # reload=True is ignored when an app *object* is passed rather than an import
-    # string, so pass the string and let uvicorn own the import.
+
+    # Auto-reload is OFF by default and deliberately NOT tied to APP_DEBUG.
+    #
+    # Two independent problems, both of which break video generation:
+    #
+    #   1. uvicorn installs WindowsSelectorEventLoopPolicy process-wide whenever
+    #      it needs a subprocess of its own -- reload, or workers > 1 (see
+    #      uvicorn/loops/asyncio.py). That loop type cannot spawn subprocesses
+    #      on Windows, so Playwright's Node driver never starts and every
+    #      browser launch fails. playwright_engine.py now repairs the policy
+    #      defensively, but not needing the repair is better.
+    #
+    #   2. StatReload watches the project root, and the pipeline writes into
+    #      outputs/, logs/ and temp/ underneath it -- so a long generation can
+    #      restart the server mid-run and destroy its own video.
+    #
+    # Set API_RELOAD=true while editing code; reload_excludes then keeps the
+    # pipeline's own output from tripping the watcher.
+    reload_enabled = os.getenv("API_RELOAD", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    reload_excludes = [
+        "outputs/*", "logs/*", "temp/*", "venv/*",
+        "*.mp4", "*.webm", "*.mp3", "*.wav", "*.json", "*.log",
+    ]
+
     uvicorn.run(
         "backend.app.main:app",
         host=settings.api_host,
         port=settings.api_port,
-        reload=settings.app_debug,
-        log_level=settings.log_level.lower()
+        reload=reload_enabled,
+        reload_excludes=reload_excludes if reload_enabled else None,
+        log_level=settings.log_level.lower(),
     )

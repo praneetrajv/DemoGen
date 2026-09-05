@@ -97,23 +97,31 @@ def check_mock_site():
 
 
 def check_playwright():
-    """Check Playwright browser installation"""
+    """Check that Playwright can actually launch and close a browser.
+
+    This used to only read ``p.chromium.executable_path``, which is a string
+    lookup that succeeds even when launching is impossible -- so the preflight
+    reported "Chromium browser available" while every real run failed with
+    "Browser launch failed". Launch a browser for real instead.
+    """
     print("\n🎬 Checking Playwright browsers...")
     try:
-        from playwright.sync_api import sync_playwright
-        with sync_playwright() as p:
-            # Try to check browser availability
-            try:
-                p.chromium.executable_path
-                print("✓ Chromium browser available")
-            except:
-                print("✗ Chromium browser NOT found")
-                print("  Run: python -m playwright install chromium --with-deps")
-                return False
+        from backend.app.modules.automation.playwright_engine import PlaywrightEngine
     except Exception as e:
-        print(f"✗ Error checking browsers: {e}")
+        print(f"✗ Could not import the Playwright engine: {type(e).__name__}: {e}")
         return False
-    
+
+    engine = PlaywrightEngine(headless=True)
+    if not engine.launch_browser():
+        print("✗ Chromium could not be launched")
+        print(f"  {engine.launch_error}")
+        print("  If the binary is missing: python -m playwright install chromium")
+        return False
+
+    try:
+        print("✓ Chromium launches and closes cleanly")
+    finally:
+        engine.close()
     return True
 
 
