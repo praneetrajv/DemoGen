@@ -271,6 +271,12 @@ class DemoGenApp {
         try {
             const health = await api.health();
             console.log('API Status:', health);
+            // Prefill the target with the bundled local demo site so a first run
+            // works without the user having to know a URL.
+            const urlField = document.getElementById('targetUrl');
+            if (urlField && !urlField.value && health.mock_site_url) {
+                urlField.value = health.mock_site_url;
+            }
         } catch (error) {
             console.warn('API not available:', error);
         }

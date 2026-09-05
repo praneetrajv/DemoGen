@@ -13,7 +13,8 @@ import time
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
 
-from backend.app.modules.automation.selenium_engine import SeleniumEngine
+from backend.app.modules.automation.playwright_engine import PlaywrightEngine
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +25,10 @@ class DOMSentinel:
     def __init__(self):
         """Initialize DOM sentinel"""
         self.snapshots = {}
-        self.storage_dir = Path("outputs/dom_snapshots")
+        # Honour the configured location instead of a cwd-relative path.
+        self.storage_dir = Path(
+            getattr(settings, "dom_snapshot_dir", None) or "outputs/dom_snapshots"
+        )
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     def _latest_snapshot_file(self, feature_name: str) -> Path:
@@ -50,8 +54,13 @@ class DOMSentinel:
             json.dump(snapshot, f, indent=2)
 
     def capture_snapshot_from_url(self, portal_url: str, feature_name: str = "mock_site") -> dict:
-        """Open a page with Selenium and capture a DOM snapshot."""
-        engine = SeleniumEngine(headless=True)
+        """Open a page in headless Chromium and capture a DOM snapshot.
+
+        Uses a real Playwright page, so ``page.evaluate`` returns actual values.
+        The previous Selenium shim silently returned None for every evaluate
+        call, which made every snapshot come back with element_count=None.
+        """
+        engine = PlaywrightEngine(headless=True)
         try:
             if not engine.launch_browser():
                 return {"success": False, "error": "Failed to launch browser for DOM capture"}
@@ -121,8 +130,10 @@ class DOMSentinel:
                 "feature_name": feature_name,
                 "portal_url": portal_url,
                 "dom_hash": dom_hash,
-                "element_count": element_count,
-                "key_elements": key_elements,
+                # Coerce to concrete types: a null here propagates into
+                # TypeErrors in compare_snapshots/detect_new_features.
+                "element_count": int(element_count or 0),
+                "key_elements": key_elements or [],
                 "timestamp": int(time.time()),
                 "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
             }
@@ -143,12 +154,12 @@ class DOMSentinel:
         """Detect newly introduced interactive elements as potential new features."""
         old_items = {
             (e.get("tag", ""), (e.get("text", "") or "").strip().lower(), e.get("selector", ""))
-            for e in old_snapshot.get("key_elements", [])
+            for e in (old_snapshot.get("key_elements") or [])
         }
 
         discovered = []
         seen = set()
-        for elem in new_snapshot.get("key_elements", []):
+        for elem in (new_snapshot.get("key_elements") or []):
             item_key = (elem.get("tag", ""), (elem.get("text", "") or "").strip().lower(), elem.get("selector", ""))
             label = (elem.get("text", "") or "").strip()
             if item_key in old_items:
@@ -183,16 +194,16 @@ class DOMSentinel:
         drift_detected = []
         
         # Check if DOM structure changed
-        if old_snapshot["dom_hash"] != new_snapshot["dom_hash"]:
+        if old_snapshot.get("dom_hash") != new_snapshot.get("dom_hash"):
             drift_detected.append({
                 "type": "structure_changed",
                 "severity": "high",
                 "description": "DOM structure has changed"
             })
-        
+
         # Check element count
-        old_count = old_snapshot.get("element_count", 0)
-        new_count = new_snapshot.get("element_count", 0)
+        old_count = old_snapshot.get("element_count") or 0
+        new_count = new_snapshot.get("element_count") or 0
         if abs(old_count - new_count) > 5:  # Threshold
             drift_detected.append({
                 "type": "element_count_changed",
@@ -201,30 +212,44 @@ class DOMSentinel:
                 "new_count": new_count,
                 "description": f"Element count changed from {old_count} to {new_count}"
             })
-        
+
         # Check for moved elements
-        old_elements = {f"{e['selector']}_{e['text'][:10]}": e for e in old_snapshot.get("key_elements", [])}
-        new_elements = {f"{e['selector']}_{e['text'][:10]}": e for e in new_snapshot.get("key_elements", [])}
+        def _key(e):
+            return f"{e.get('selector', '')}_{(e.get('text') or '')[:10]}"
+
+        old_elements = {_key(e): e for e in (old_snapshot.get("key_elements") or [])}
+        new_elements = {_key(e): e for e in (new_snapshot.get("key_elements") or [])}
         
         for key, new_elem in new_elements.items():
             if key in old_elements:
                 old_elem = old_elements[key]
-                pos_diff_x = abs(new_elem["position"]["x"] - old_elem["position"]["x"])
-                pos_diff_y = abs(new_elem["position"]["y"] - old_elem["position"]["y"])
-                
+                new_pos = new_elem.get("position") or {}
+                old_pos = old_elem.get("position") or {}
+                if not new_pos or not old_pos:
+                    continue
+                pos_diff_x = abs((new_pos.get("x") or 0) - (old_pos.get("x") or 0))
+                pos_diff_y = abs((new_pos.get("y") or 0) - (old_pos.get("y") or 0))
+
                 if pos_diff_x > 20 or pos_diff_y > 20:  # Pixel threshold
                     drift_detected.append({
                         "type": "element_moved",
                         "severity": "medium",
                         "element": key,
-                        "old_position": old_elem["position"],
-                        "new_position": new_elem["position"]
+                        "old_position": old_pos,
+                        "new_position": new_pos
                     })
-        
+
+        # Weight by severity and clamp to [0, 1]. The old formula was a flat
+        # 0.1 per item, so a single high-severity structure change scored 0.9 --
+        # above the 0.85 threshold -- and regeneration never triggered.
+        penalty = sum(
+            {"high": 0.35, "medium": 0.15}.get(d.get("severity"), 0.05)
+            for d in drift_detected
+        )
         return {
             "feature_name": new_snapshot.get("feature_name"),
             "drift_detected": len(drift_detected) > 0,
             "drift_count": len(drift_detected),
             "drift_items": drift_detected,
-            "similarity_score": 1.0 - (len(drift_detected) * 0.1)  # Simple scoring
+            "similarity_score": round(max(0.0, min(1.0, 1.0 - penalty)), 3),
         }

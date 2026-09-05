@@ -21,15 +21,26 @@ from starlette.concurrency import run_in_threadpool
 from backend.app.modules.sentinel.dom_monitor import DOMSentinel
 from backend.app.modules.sentinel.drift_detector import DriftDetector
 
+try:  # single source of truth for the version string
+    from __version__ import __version__ as APP_VERSION
+except ImportError:  # pragma: no cover - defensive
+    APP_VERSION = "0.0.0"
+
 router = APIRouter(prefix="/api", tags=["demo"])
 logger = logging.getLogger(__name__)
+
+# Single source of truth: /generate and /validate-prompt used to disagree (5 vs
+# 10), so the UI's pre-flight check rejected prompts the generator accepted.
+MIN_PROMPT_LENGTH = 10
 
 
 def _resolve_video_file(video_id: str) -> Optional[Path]:
     """Resolve the generated video file location for a session.
 
-    Checks final composed demos first, then any selenium recording left in the
-    session folder so partial runs still return playable output.
+    Checks final composed demos first, then any raw browser recording left in
+    the session folder so partial runs still return playable output. Playwright
+    writes .webm by default and names clips with a random hash, so we glob on
+    extension rather than a filename prefix.
     """
     candidates = [
         Path(settings.output_dir) / f"demo_{video_id}.mp4",
@@ -42,26 +53,14 @@ def _resolve_video_file(video_id: str) -> Optional[Path]:
 
     session_dir = Path(settings.output_dir) / f"session_{video_id}"
     if session_dir.is_dir():
-        selenium_videos = sorted(
-            [
-                p for p in session_dir.glob("selenium_*.mp4")
-                if p.is_file() and p.stat().st_size > 0
-            ],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if selenium_videos:
-            return selenium_videos[0]
-        other = sorted(
-            [
-                p for p in session_dir.glob("*.mp4")
-                if p.is_file() and p.stat().st_size > 0
-            ],
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if other:
-            return other[0]
+        raw = [
+            p
+            for pattern in ("*.mp4", "*.webm")
+            for p in session_dir.rglob(pattern)
+            if p.is_file() and p.stat().st_size > 0
+        ]
+        if raw:
+            return max(raw, key=lambda p: p.stat().st_mtime)
     return None
 
 
@@ -77,11 +76,19 @@ class DemoRequest(BaseModel):
 
 
 class DemoResponse(BaseModel):
-    """Response model for demo generation"""
+    """Response model for demo generation.
+
+    The frontend reads ``duration`` and ``quality_score`` when rendering the
+    result panel. Fields not declared here are silently dropped by FastAPI's
+    response_model, so they must stay declared even though they are optional.
+    """
     session_id: str
     status: str
     message: str
     video_url: Optional[str] = None
+    duration: Optional[float] = None
+    quality_score: Optional[float] = None
+    prompt: Optional[str] = None
 
 
 class HealthResponse(BaseModel):
@@ -89,6 +96,26 @@ class HealthResponse(BaseModel):
     status: str
     service: str
     version: str
+    environment: str
+    mock_site_url: str
+
+
+def build_health_payload() -> dict:
+    """Shared health body so /health and /api/health can never drift apart."""
+    return {
+        "status": "ok",
+        "service": "DemoGen API",
+        "version": APP_VERSION,
+        "environment": settings.app_env,
+        # Lets the UI prefill a target that actually works out of the box.
+        "mock_site_url": _build_local_mock_url(settings.mock_site_home_path),
+    }
+
+
+@router.get("/health", response_model=HealthResponse)
+async def api_health():
+    """Health check under the /api prefix (what the web UI polls)."""
+    return build_health_payload()
 
 
 class DOMRefreshRequest(BaseModel):
@@ -197,10 +224,10 @@ async def generate_demo(request: DemoRequest):
     """
     try:
         # Validate prompt
-        if not request.prompt or len(request.prompt) < 5:
+        if not request.prompt or len(request.prompt.strip()) < MIN_PROMPT_LENGTH:
             raise HTTPException(
                 status_code=400,
-                detail="Prompt must be at least 5 characters long"
+                detail=f"Prompt must be at least {MIN_PROMPT_LENGTH} characters long"
             )
         
         target_url = _resolve_target_url(request)
@@ -243,6 +270,9 @@ async def generate_demo(request: DemoRequest):
                     status=status,
                     message=message,
                     video_url=f"/api/download/{session_id}" if has_video else None,
+                    duration=duration,
+                    quality_score=result.get("quality_score"),
+                    prompt=request.prompt,
                 )
 
             if (request.allow_partial or has_video) and session_id and has_video:
@@ -254,6 +284,9 @@ async def generate_demo(request: DemoRequest):
                         f"{result.get('error', 'Unknown error')}"
                     ),
                     video_url=f"/api/download/{session_id}",
+                    duration=result.get("duration"),
+                    quality_score=result.get("quality_score"),
+                    prompt=request.prompt,
                 )
 
             raise HTTPException(
@@ -375,20 +408,20 @@ async def download_video(video_id: str):
 @router.post("/validate-prompt")
 async def validate_prompt(request: DemoRequest):
     """Validate user prompt before generation"""
-    try:
-        if not request.prompt or len(request.prompt) < 10:
-            raise HTTPException(
-                status_code=400,
-                detail="Prompt must be at least 10 characters long"
-            )
-        
+    if not request.prompt or len(request.prompt.strip()) < MIN_PROMPT_LENGTH:
+        # Returned as 200 with valid=False so the UI can show the reason inline
+        # instead of the generic "API Error 400" produced by a raised status.
         return {
-            "valid": True,
-            "message": "Prompt is valid",
-            "estimated_duration": 120
+            "valid": False,
+            "message": f"Prompt must be at least {MIN_PROMPT_LENGTH} characters long",
+            "estimated_duration": None,
         }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
+
+    return {
+        "valid": True,
+        "message": "Prompt is valid",
+        "estimated_duration": 120,
+    }
 
 
 @router.post("/dom/check-and-regenerate")

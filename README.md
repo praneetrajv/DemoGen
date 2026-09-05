@@ -9,7 +9,7 @@ DemoGen automatically generates professional demo videos by combining LLM-driven
 ## Features
 
 - **LLM-Powered Planning** — Uses OpenRouter (Groq/GPT) or Google Gemini to convert text prompts into structured browser automation steps
-- **Browser Automation** — Executes planned actions via Selenium or Playwright on Chrome/Brave
+- **Browser Automation** — Executes planned actions in a local Chromium via Playwright
 - **Screen Recording** — Captures the browser screen during automation at 1080p/30fps
 - **Text-to-Speech Narration** — Generates voiceover for each step using gTTS (free) or ElevenLabs (premium)
 - **Video Composition** — Merges screen recording with narration into a final MP4 using FFmpeg
@@ -41,7 +41,7 @@ Text Prompt
       │
       ▼
 ┌─────────────┐
-│  Automation   │  Selenium/Playwright executes actions while recording screen
+│  Automation   │  Playwright executes actions while recording the screen
 └─────┬───────┘
       │
       ▼
@@ -66,10 +66,10 @@ Text Prompt
 |-------|-----------|
 | Language | Python 3.12 |
 | Backend | FastAPI + Uvicorn |
-| LLM | OpenRouter (Groq), Google Gemini |
-| Browser Automation | Selenium, Playwright |
-| TTS | gTTS, ElevenLabs, pyttsx3 |
-| Video | FFmpeg, MoviePy, imageio |
+| LLM | Any OpenAI-compatible chat endpoint (OpenRouter, Groq), Google Gemini |
+| Browser Automation | Playwright (Chromium) |
+| TTS | gTTS |
+| Video | FFmpeg (via `imageio-ffmpeg`) |
 | Database (optional) | PostgreSQL + SQLAlchemy + Alembic |
 | Frontend | Vanilla HTML/CSS/JS |
 | Containerization | Docker |
@@ -79,8 +79,8 @@ Text Prompt
 ## Prerequisites
 
 - **Python 3.12+**
-- **FFmpeg** — installed and available in PATH (or use bundled `imageio-ffmpeg`)
-- **Chrome** or **Brave** browser installed locally
+- **Playwright browsers** — `python -m playwright install chromium` (one-time)
+- **FFmpeg** — bundled via `imageio-ffmpeg`; a system FFmpeg on PATH also works
 - **API Keys** — at least one of:
   - [OpenRouter](https://openrouter.ai/) or [Groq](https://groq.com/) API key
   - [Google Gemini](https://ai.google.dev/) API key
@@ -146,7 +146,7 @@ API_HOST=0.0.0.0
 # Browser Settings
 BROWSER_PROVIDER=local
 USE_BRAVE=false
-SELENIUM_HEADLESS=false
+BROWSER_HEADLESS=false
 
 # Video Output
 VIDEO_QUALITY=1080p
@@ -197,9 +197,14 @@ docker run -p 8000:8000 demogen
 ### Run tests
 
 ```bash
-pytest test_api.py
-pytest test_improved_video.py
-pytest test_playwright_video.py
+# Fast, no server needed: checks the built-in action plan still matches
+# the mock site's DOM ids.
+pytest test_mock_site_contract.py -v
+
+# Integration tests. These skip automatically unless the API is running,
+# and they read API_PORT from .env (override with DEMOGEN_API_BASE).
+pytest test_api.py -v
+pytest test_improved_video.py -v      # full end-to-end, can take minutes
 ```
 
 ---
@@ -208,10 +213,12 @@ pytest test_playwright_video.py
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
+| `GET` | `/health`, `/api/health` | Liveness + version + the mock site URL the UI prefills |
 | `POST` | `/api/generate` | Generate a demo video from a text prompt |
 | `GET` | `/api/videos/{session_id}` | Get video metadata and status |
 | `GET` | `/api/download/{session_id}` | Download the generated video |
 | `GET` | `/api/demos` | List available demo templates |
+| `GET` | `/api/languages` | List supported narration languages |
 | `POST` | `/api/validate-prompt` | Validate a prompt before generation |
 | `POST` | `/api/dom/check-and-regenerate` | Check for DOM drift and regenerate if needed |
 
@@ -224,18 +231,20 @@ PROJECT/
 ├── backend/
 │   ├── app/
 │   │   ├── main.py                 # FastAPI entry point
-│   │   ├── mock_site_server.py     # Mock site server for dev
+│   │   ├── mock_site_server.py     # Serves mock_site/ on its own port
 │   │   ├── api/
 │   │   │   └── routes.py           # API route definitions
 │   │   └── modules/
-│   │       ├── automation/         # Selenium & Playwright engines
-│   │       ├── database/           # SQLAlchemy models & connection
+│   │       ├── automation/         # Playwright engine + LLM action planner
+│   │       ├── database/           # SQLAlchemy models & connection (optional)
 │   │       ├── llm/                # OpenRouter & Gemini integration
 │   │       ├── tts/                # Text-to-speech generation
 │   │       ├── video/              # FFmpeg video composition
 │   │       ├── validation/         # Video quality checks
 │   │       └── sentinel/           # DOM drift detection
-│   └── mock_site/                  # Mock HTML pages
+├── mock_site/                      # Bundled demo target (repo root, not backend/)
+│   ├── index.html
+│   └── dashboard.html              # GPU fleet console the fallback plan drives
 ├── frontend/
 │   ├── index.html                  # Web UI
 │   └── static/
@@ -247,10 +256,12 @@ PROJECT/
 ├── logs/                           # Application logs
 ├── config.py                       # Pydantic settings (.env loader)
 ├── pipeline.py                     # Main demo generation pipeline
-├── setup.py                        # Setup & dependency checks
+├── setup.py                        # Preflight checks (NOT a packaging script)
+├── conftest.py                     # Shared pytest fixtures
 ├── requirements.txt                # Python dependencies
 ├── Dockerfile                      # Docker configuration
-└── .env                            # Environment variables
+├── .env.example                    # Config template - copy to .env
+└── .env                            # Environment variables (gitignored)
 ```
 
 ---

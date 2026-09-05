@@ -14,7 +14,7 @@ from datetime import datetime
 sys.path.insert(0, str(Path(__file__).parent))
 
 from backend.app.modules.llm.orchestrator import LLMOrchestrator
-from backend.app.modules.automation.selenium_engine import SeleniumEngine
+from backend.app.modules.automation.playwright_engine import PlaywrightEngine
 from backend.app.modules.automation.action_planner import ActionPlanner
 from backend.app.modules.tts.generator import TTSGenerator
 from backend.app.modules.video.composer import VideoComposer
@@ -190,7 +190,7 @@ class DemoGenerationPipeline:
             )
 
             if not video_result.get("success"):
-                # Fall back to the raw selenium recording so the user still gets output.
+                # Fall back to the raw browser recording so the user still gets output.
                 if has_recording:
                     logger.warning(
                         "Composition failed (%s); using raw recording",
@@ -315,7 +315,7 @@ class DemoGenerationPipeline:
         feature: Optional[str] = None,
         narration_result: Optional[Dict] = None,
     ) -> Dict:
-        """Execute automation using Selenium's continuous video recording.
+        """Execute automation using Playwright's native context video recorder.
 
         When per-step narration durations are available, each action holds on
         screen for that step's audio length so speech and UI stay aligned.
@@ -335,20 +335,23 @@ class DemoGenerationPipeline:
                 provider = "brave"
 
             logger.info(
-                f"🌐 Launching free local browser for recording (provider={provider}, actions={len(actions)})..."
+                f"🌐 Launching local Chromium for recording (provider={provider}, actions={len(actions)})..."
             )
 
             if provider == "brave":
-                engine = SeleniumEngine(
-                    headless=settings.selenium_headless,
-                    binary_path=settings.brave_binary_path,
-                    user_data_dir=settings.brave_user_data_dir,
-                    profile_dir=settings.brave_profile,
-                    debugger_address=settings.brave_debugger_address,
+                # Brave is Chromium-based; drive it by pointing Playwright at
+                # the binary. Falls back to bundled Chromium if unset.
+                engine = PlaywrightEngine(
+                    headless=settings.browser_headless,
+                    executable_path=settings.brave_binary_path,
+                )
+            elif provider in {"chrome", "msedge"}:
+                engine = PlaywrightEngine(
+                    headless=settings.browser_headless,
+                    channel=provider,
                 )
             else:
-                # Free local Chrome via Selenium + stealth (no cloud / paid services)
-                engine = SeleniumEngine(headless=settings.selenium_headless)
+                engine = PlaywrightEngine(headless=settings.browser_headless)
 
             action_exec_start = time.time()
             
@@ -460,7 +463,6 @@ class DemoGenerationPipeline:
                 action_status = "completed"
                 action_error = None
                 step_t0 = time.time()
-                video_start_s = step_t0 - recording_t0
 
                 try:
                     if action_type == 'navigate':
@@ -493,12 +495,12 @@ class DemoGenerationPipeline:
                             action_error = "Missing selector for fill"
                             
                     elif action_type == 'scroll':
-                        amount = action.get('amount', 500)
-                        try:
-                            amount = int(amount)
-                        except Exception:
-                            amount = 500
-                        engine.page.evaluate(f"window.scrollBy(0, {amount})")
+                        result = engine.scroll(
+                            direction=action.get('direction', 'down'),
+                            amount=action.get('amount', 500),
+                        )
+                        action_status = result.get("status", action_status)
+                        action_error = result.get("error")
                         
                     elif action_type == 'wait':
                         # Wait actions still use narration pacing below.
@@ -523,8 +525,35 @@ class DemoGenerationPipeline:
                                 action_status = "completed"
                                 action_error = None
                         
+                    elif action_type == 'select':
+                        selector = action.get('selector')
+                        if selector:
+                            result = engine.select_option(
+                                selector,
+                                value=action.get('value'),
+                                index=action.get('index'),
+                                label=action.get('label'),
+                            )
+                            action_status = result.get("status", action_status)
+                            action_error = result.get("error")
+                        else:
+                            action_status = "failed"
+                            action_error = "Missing selector for select"
+
+                    elif action_type == 'hover':
+                        selector = action.get('selector')
+                        if selector:
+                            result = engine.hover(selector)
+                            action_status = result.get("status", action_status)
+                            action_error = result.get("error")
+                        else:
+                            action_status = "failed"
+                            action_error = "Missing selector for hover"
+
                     else:
-                        time.sleep(0.3)
+                        # Unknown action types are reported, not silently held.
+                        action_status = "failed"
+                        action_error = f"Unsupported action_type: {action_type!r}"
 
                     # Encode this step's full narration window as video frames
                     # showing the post-action UI (true timeline sync, not wall sleep).
@@ -545,10 +574,11 @@ class DemoGenerationPipeline:
                     action_error = str(exec_error)
                     logger.warning(f"      Action execution error: {exec_error}")
 
-                # Timeline uses cumulative *encoded* duration (frame-based), not wall clock.
-                frames = int(getattr(engine, "_total_frames", 0) or 0)
-                fps = float(getattr(engine, "_record_fps", 5) or 5)
-                video_end_s = frames / fps if fps else (time.time() - recording_t0)
+                # Playwright records in real time, so the video timeline is
+                # simply wall clock measured from the moment recording began.
+                # (The old frame-counting math drifted by 1/fps per step
+                # because snapshot_frame() added an uncounted frame.)
+                video_end_s = time.time() - recording_t0
                 video_start_s = max(0.0, video_end_s - target_hold)
                 action["status"] = action_status
                 action["video_start_s"] = round(video_start_s, 3)
@@ -704,15 +734,17 @@ class DemoGenerationPipeline:
         except Exception as e:
             logger.warning(f"Finalize recording error: {e}")
 
-        # Also scan session dir for selenium_*.mp4 in case the property was cleared.
+        # Fallback: Playwright names its clips with a random hash, so scan the
+        # session dir for whatever recording landed there.
         if (not video_file or not Path(video_file).exists()) and automation_dir:
-            candidates = sorted(
-                Path(automation_dir).glob("selenium_*.mp4"),
-                key=lambda p: p.stat().st_mtime if p.exists() else 0,
-                reverse=True,
-            )
+            candidates = [
+                p
+                for pattern in ("*.webm", "*.mp4")
+                for p in Path(automation_dir).glob(pattern)
+                if p.is_file() and p.stat().st_size > 0
+            ]
             if candidates:
-                video_file = str(candidates[0])
+                video_file = str(max(candidates, key=lambda p: p.stat().st_mtime))
 
         has_video = bool(video_file and Path(video_file).exists() and Path(video_file).stat().st_size > 0)
         result = {
@@ -943,7 +975,7 @@ class DemoGenerationPipeline:
                 "overall_valid": validation.get("valid", True),
                 "score": validation.get("score", 100),
                 "content_match_score": 100,
-                "content_match_reasoning": "Using Selenium automation - content verified by execution",
+                "content_match_reasoning": "Browser automation - content verified by execution",
                 "issues": validation.get("issues", [])
             }
         except Exception as e:
@@ -1130,16 +1162,14 @@ class DemoGenerationPipeline:
                 "wait_ms": 800,
             },
             {
-                "action_type": "click",
+                # A native <select> cannot be driven by clicking its <option>
+                # elements -- Chromium renders the dropdown outside the page.
+                # Use the select action, which maps to select_option().
+                "action_type": "select",
                 "selector": "#tier",
-                "description": "Open the workspace tier selector",
-                "wait_ms": 500,
-            },
-            {
-                "action_type": "click",
-                "selector": "#tier option:nth-child(2)",
-                "description": "Select GPU Pro tier",
-                "wait_ms": 500,
+                "value": "gpu-pro",
+                "description": "Choose the GPU Pro workspace tier",
+                "wait_ms": 900,
             },
             {
                 "action_type": "click",

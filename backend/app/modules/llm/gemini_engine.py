@@ -16,23 +16,38 @@ class GeminiEngine:
     """Generate smart automation steps using Gemini's thinking capability"""
     
     def __init__(self, api_key: Optional[str] = None):
-        """Initialize Gemini engine"""
-        # Try config system first, then env var, then parameter
-        resolved_key = api_key or os.getenv("GEMINI_API_KEY", "")
-        if not resolved_key:
-            try:
-                import sys
-                from pathlib import Path
-                sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
-                from config import settings
-                resolved_key = settings.gemini_api_key or ""
-            except:
-                pass
-        
+        """Initialize Gemini engine.
+
+        Resolution order: explicit argument, GEMINI_API_KEY env var, then
+        config. Placeholder values (`your_api_key_here` and friends) are
+        treated as unset -- otherwise they are truthy, genai gets configured
+        with a bogus credential, and every call fails with a provider 401
+        instead of the app reporting that no key is present.
+        """
+        import sys
+        from pathlib import Path
+
+        sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
+        try:
+            from config import real_secret, settings
+        except ImportError:  # pragma: no cover - config should always import
+            logger.warning("Could not import config; relying on env vars only")
+            real_secret, settings = (lambda v: (v or "").strip()), None
+
+        resolved_key = real_secret(api_key) or real_secret(os.getenv("GEMINI_API_KEY"))
+        if not resolved_key and settings is not None:
+            resolved_key = real_secret(settings.gemini_api_key)
+
         self.api_key = resolved_key
         if self.api_key:
             genai.configure(api_key=self.api_key)
-        self.model = "gemini-2.0-flash-thinking-exp-01-21"
+        # One model name for the whole class. The file used to hardcode
+        # "gemini-2.0-flash-thinking-exp-01-21" here and plain
+        # "gemini-2.0-flash" in two other methods, so settings.gemini_model
+        # was never honoured anywhere.
+        self.model = (
+            getattr(settings, "gemini_model", None) or "gemini-2.0-flash"
+        ) if settings is not None else "gemini-2.0-flash"
     
     def generate_demo_steps(self, prompt: str, website_dom: str) -> List[Dict]:
         """
@@ -143,7 +158,9 @@ Generate realistic steps that would create a compelling demo video on this websi
         try:
             logger.info(f"📸 Reviewing screenshot for step {current_step}/{total_steps}")
             
-            response = genai.GenerativeModel("gemini-2-0-flash").generate_content(
+            # Was "gemini-2-0-flash" (hyphens, not dots) -- a nonexistent model
+            # id, so every screenshot review returned a 404 from the provider.
+            response = genai.GenerativeModel(self.model).generate_content(
                 [
                     {
                         "text": f"Analyze this website screenshot for step {current_step}/{total_steps} of a demo. Describe what you see in 1-2 sentences. Is this step successful? Respond with: {{\"visible\": \"what's on screen\", \"success\": true/false}}"
@@ -216,7 +233,7 @@ RULES:
 
 Return ONLY the narration script text, no JSON, no formatting marks."""
 
-            response = genai.GenerativeModel("gemini-2.0-flash").generate_content(prompt)
+            response = genai.GenerativeModel(self.model).generate_content(prompt)
             narration = response.text.strip()
             
             logger.info(f"✓ Gemini narration generated: {len(narration)} chars")
@@ -299,7 +316,7 @@ A score of 70+ means the video is acceptable. Below 70 means it likely doesn't m
             # Send frames + prompt to Gemini vision
             content_parts = [{"text": text_prompt}] + frame_parts
             
-            response = genai.GenerativeModel("gemini-2.0-flash").generate_content(content_parts)
+            response = genai.GenerativeModel(self.model).generate_content(content_parts)
             response_text = response.text.strip()
             
             # Parse the JSON response

@@ -19,18 +19,26 @@ class APIClient {
             ...options
         };
 
-        try {
-            const response = await fetch(url, defaultOptions);
-            
-            if (!response.ok) {
-                throw new Error(`API Error: ${response.status} ${response.statusText}`);
-            }
+        const response = await fetch(url, defaultOptions);
 
-            return await response.json();
-        } catch (error) {
-            console.error('API Request failed:', error);
-            throw error;
+        if (!response.ok) {
+            // Surface the server's own message. Without this every failure
+            // reached the UI as "API Error: 500 Internal Server Error", which
+            // hid the actual pipeline error.
+            let detail = '';
+            try {
+                const body = await response.json();
+                detail = body.detail || body.error || body.message || '';
+            } catch (_) {
+                try { detail = (await response.text()).slice(0, 300); } catch (_) { /* ignore */ }
+            }
+            const err = new Error(detail || `${response.status} ${response.statusText}`);
+            err.status = response.status;
+            console.error(`API ${options.method || 'GET'} ${url} failed:`, err.message);
+            throw err;
         }
+
+        return response.json();
     }
 
     async get(endpoint) {
@@ -56,17 +64,18 @@ class APIClient {
     }
 
     // DemoGen Specific Methods
-    
+
     async health() {
         return this.get('/health');
     }
 
-    async generateDemo(prompt, language = 'en', feature = null, targetUrl = null) {
+    async generateDemo(prompt, language = 'en', feature = null, targetUrl = null, useMockSite = null) {
         return this.post('/generate', {
             prompt,
             language,
             feature,
-            use_mock_site: false,
+            // null lets the server decide via USE_MOCK_SITE_BY_DEFAULT.
+            use_mock_site: useMockSite,
             target_url: targetUrl,
             allow_partial: true
         });
@@ -89,18 +98,6 @@ class APIClient {
             prompt,
             language
         });
-    }
-
-    async getSessions() {
-        return this.get('/sessions');
-    }
-
-    async getSession(sessionId) {
-        return this.get(`/session/${sessionId}`);
-    }
-
-    async getSessionScript(sessionId) {
-        return this.get(`/session/${sessionId}/script`);
     }
 }
 

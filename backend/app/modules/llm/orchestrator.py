@@ -17,8 +17,10 @@ class LLMOrchestrator:
     """Manages LLM interactions for demo generation (OpenRouter)."""
 
     def __init__(self):
-        # Prefer OpenRouter; fall back to legacy GROQ_* if present
-        self.api_key = settings.openrouter_api_key or settings.groq_api_key
+        # llm_api_key filters out placeholders like `your_api_key_here`, which
+        # are truthy and previously produced a provider 401 instead of a clear
+        # "no key configured" message.
+        self.api_key = settings.llm_api_key
         self.api_base = (
             settings.openrouter_api_base
             or settings.groq_api_base
@@ -27,16 +29,20 @@ class LLMOrchestrator:
         self.model = (
             settings.openrouter_model
             or settings.groq_model
-            or "google/gemma-4-31b-it:free"
+            # Matches config.py's default. Do not invent a model name here:
+            # a nonexistent id surfaces as an opaque 400 from the provider.
+            or "meta-llama/llama-3.3-70b-instruct:free"
         )
-        self.reasoning_enabled = bool(
-            getattr(settings, "openrouter_reasoning_enabled", True)
-        )
+        self.reasoning_enabled = bool(settings.openrouter_reasoning_enabled)
         self.conversation_history = []
 
     def _call_chat_completions(self, messages: list, max_tokens: int) -> dict:
         if not self.api_key:
-            raise ValueError("OPENROUTER_API_KEY is not configured")
+            raise ValueError(
+                "No LLM API key configured. Set OPENROUTER_API_KEY in .env "
+                "(the shipped `your_api_key_here` placeholder counts as unset). "
+                "Without it the pipeline uses its built-in mock action plan."
+            )
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",

@@ -25,18 +25,11 @@ FEATURES = {
 }
 
 # Supported models
-MODELS = {
-    "primary": {
-        "provider": "openrouter",
-        "model": "google/gemma-4-31b-it:free",
-        "description": "Primary LLM for action planning and narration (free)"
-    },
-    "validation": {
-        "provider": "openrouter",
-        "model": "google/gemma-4-31b-it:free",
-        "description": "Video validation / quality checks (free)"
-    }
-}
+#
+# Removed: this dict hardcoded "google/gemma-4-31b-it:free" -- a model id that
+# does not exist -- and nothing ever read it. The model in use is whatever
+# OPENROUTER_MODEL resolves to in config.py / .env; that is the single source
+# of truth. Read it with `from config import settings; settings.openrouter_model`.
 
 # Database schema version
 DB_VERSION = "1.0.0"

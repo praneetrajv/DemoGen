@@ -42,28 +42,58 @@ def setup_database():
 
 def check_dependencies():
     """Check if all dependencies are installed"""
-    dependencies = [
+    required = [
         ("fastapi", "FastAPI"),
+        ("uvicorn", "Uvicorn"),
         ("playwright", "Playwright"),
         ("requests", "Requests"),
         ("gtts", "Google TTS"),
         ("imageio_ffmpeg", "ImageIO FFmpeg"),
-        ("sqlalchemy", "SQLAlchemy"),
-        ("psycopg2", "psycopg2"),
+        ("pydantic_settings", "Pydantic Settings"),
     ]
-    
+    # Only needed for the optional Postgres session store and the optional
+    # Gemini visual validation. A missing one used to fail the whole preflight.
+    optional = [
+        ("sqlalchemy", "SQLAlchemy", "database session history"),
+        ("psycopg2", "psycopg2", "Postgres driver"),
+        ("google.generativeai", "Gemini SDK", "visual video validation"),
+        ("imageio", "ImageIO", "frame extraction for visual validation"),
+    ]
+
     print("\n📦 Checking dependencies...")
     all_installed = True
-    
-    for module, name in dependencies:
+
+    for module, name in required:
         try:
             __import__(module)
             print(f"✓ {name}")
         except ImportError:
-            print(f"✗ {name} - NOT INSTALLED")
+            print(f"✗ {name} - NOT INSTALLED (required)")
             all_installed = False
-    
+
+    for module, name, why in optional:
+        try:
+            __import__(module)
+            print(f"✓ {name}")
+        except ImportError:
+            print(f"⏭ {name} - not installed (optional: {why})")
+
     return all_installed
+
+
+def check_mock_site():
+    """The default demo target is the bundled mock site, so it must exist."""
+    print("\n🧪 Checking bundled mock site...")
+    home = settings.mock_site_home_path.lstrip("/")
+    page = project_root / "mock_site" / home
+    if not page.exists():
+        print(f"✗ Missing {page}")
+        print(f"  MOCK_SITE_HOME_PATH={settings.mock_site_home_path} points at nothing.")
+        return False
+    print(f"✓ mock_site/{home} present")
+    print(f"  Serve it with: python -m uvicorn backend.app.mock_site_server:app "
+          f"--port {settings.mock_site_port}")
+    return True
 
 
 def check_playwright():
@@ -90,16 +120,17 @@ def check_playwright():
 def check_api_keys():
     """Check if required API keys are configured"""
     print("\n🔑 Checking API keys...")
-    
-    key = getattr(settings, "openrouter_api_key", None) or getattr(settings, "groq_api_key", None)
-    if not key or str(key).startswith("your_"):
+
+    # settings.llm_configured filters placeholders such as `your_api_key_here`,
+    # which are truthy strings and used to read as "configured".
+    if not settings.llm_configured:
         print("⚠ OPENROUTER_API_KEY not configured")
-        print("  Add your key to .env file")
+        print("  Add your key to .env (the `your_api_key_here` placeholder counts as unset)")
+        print("  Without it the pipeline falls back to its built-in mock action plan,")
+        print("  which only works against the bundled mock site.")
         return False
-    else:
-        model = getattr(settings, "openrouter_model", None) or "google/gemma-4-31b-it:free"
-        print(f"✓ OpenRouter API key configured (model: {model})")
-    
+
+    print(f"✓ LLM API key configured (model: {settings.openrouter_model})")
     return True
 
 
@@ -163,7 +194,11 @@ def setup():
     if not check_api_keys():
         print("\n⚠ Warning: OpenRouter API key not configured")
         print("  Add OPENROUTER_API_KEY to .env file")
-    
+
+    # The bundled mock site is the default demo target
+    if not check_mock_site():
+        return False
+
     # Check database (optional)
     check_database_connection()
     

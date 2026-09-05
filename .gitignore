@@ -85,6 +85,13 @@ docker-compose.override.yml
 *.backup
 *~
 
+# Build/scratch leftovers that should never be committed
+*.zip
+DemoGen-zip.zip
+test_output.txt
+test_output*.txt
+.playwright-browsers/
+
 # IDE metadata
 .vscode/*
 !.vscode/settings.json

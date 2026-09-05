@@ -1,5 +1,6 @@
-"""Automation Modules Package — free local browser engines only."""
+"""Automation modules — local Chromium via Playwright."""
 
-from .selenium_engine import SeleniumEngine
+from .action_planner import ActionPlanner
+from .playwright_engine import PlaywrightEngine
 
-__all__ = ["SeleniumEngine"]
+__all__ = ["ActionPlanner", "PlaywrightEngine"]

@@ -1,457 +1,598 @@
 """
 Playwright Automation Engine
-Handles browser automation with Playwright sync API
+
+Drives a local Chromium instance and records the session using Playwright's
+native context video recorder. Because recording is real-time and handled by
+the browser itself, pacing a step is just "hold for N seconds" -- there is no
+frame counting, no screenshot loop, and no imageio dependency.
+
+Every action returns a log dict of the shape:
+    {"action": str, "status": "completed" | "failed", "timestamp": float, ...}
+so the pipeline can branch on ``status`` without inspecting exceptions.
 """
 
-import sys
-from pathlib import Path
-from typing import List, Dict, Optional
-from playwright.sync_api import sync_playwright, Page
-import time
-import logging
+from __future__ import annotations
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent.parent.parent))
+import logging
+import time
+from pathlib import Path
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
+
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 
 logger = logging.getLogger(__name__)
 
+# Only real web traffic. Blocks file://, chrome://, view-source:, data: and
+# friends, which an LLM-authored plan can otherwise talk us into opening.
+ALLOWED_URL_SCHEMES = {"http", "https"}
+
+# Substrings that indicate an interstitial bot wall rather than real content.
+# Matched against the page title only -- matching raw HTML produces constant
+# false positives on any page that happens to mention verification.
+BOT_CHALLENGE_TITLES = (
+    "just a moment",
+    "attention required",
+    "verify you are human",
+    "checking your browser",
+    "access denied",
+    "are you a robot",
+)
+
+VIEWPORT = {"width": 1920, "height": 1080}
+
+
+def _is_navigable(url: str) -> bool:
+    """True if ``url`` is an http(s) address we are willing to open."""
+    try:
+        return urlparse(url).scheme.lower() in ALLOWED_URL_SCHEMES
+    except (ValueError, AttributeError):
+        return False
+
 
 class PlaywrightEngine:
-    """Browser automation using Playwright sync API"""
-    
-    def __init__(self, headless: bool = False):
-        """Initialize Playwright engine"""
+    """Browser automation with native video recording."""
+
+    def __init__(
+        self,
+        headless: bool = False,
+        channel: Optional[str] = None,
+        executable_path: Optional[str] = None,
+        slow_mo_ms: int = 0,
+    ):
         self.headless = headless
+        self.channel = channel or None
+        self.executable_path = executable_path or None
+        self.slow_mo_ms = slow_mo_ms
+        self.playwright = None
         self.browser = None
         self.context = None
         self.page = None
-        self.logs = []
-    
-    def launch_browser(self):
-        """Launch Chromium browser with reduced automation fingerprints"""
+        self.logs: List[Dict] = []
+        self._video_dir: Optional[Path] = None
+        self._recorded_video_path: Optional[str] = None
+
+    # ------------------------------------------------------------------
+    # logging helper
+    # ------------------------------------------------------------------
+    def _log(self, action: str, status: str, **fields) -> Dict:
+        entry = {"action": action, "status": status, "timestamp": time.time()}
+        entry.update(fields)
+        self.logs.append(entry)
+        return entry
+
+    def get_logs(self) -> List[Dict]:
+        return list(self.logs)
+
+    # ------------------------------------------------------------------
+    # lifecycle
+    # ------------------------------------------------------------------
+    def launch_browser(self) -> bool:
+        """Start Playwright and launch Chromium. Returns False on failure."""
         try:
             self.playwright = sync_playwright().start()
-            self.browser = self.playwright.chromium.launch(
-                headless=self.headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-infobars",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                ],
-            )
-            logger.info("Chromium browser launched successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to launch browser: {e}")
+        except Exception as exc:
+            logger.error("Could not start Playwright: %s", exc)
             return False
-    
-    def create_context(self, video_dir: str = "outputs/videos"):
-        """Create browser context with video recording and stealth init scripts"""
-        if not self.browser:
-            return False
-        
+
+        launch_kwargs = {
+            "headless": self.headless,
+            "args": [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-infobars",
+                "--start-maximized",
+            ],
+        }
+        if self.slow_mo_ms:
+            launch_kwargs["slow_mo"] = self.slow_mo_ms
+        if self.executable_path:
+            # Any Chromium build (e.g. a local Brave install).
+            launch_kwargs["executable_path"] = self.executable_path
+        elif self.channel:
+            launch_kwargs["channel"] = self.channel
+
         try:
-            from pathlib import Path
-            Path(video_dir).mkdir(parents=True, exist_ok=True)
-            
+            self.browser = self.playwright.chromium.launch(**launch_kwargs)
+            logger.info(
+                "Chromium launched (headless=%s, binary=%s)",
+                self.headless,
+                self.executable_path or self.channel or "bundled",
+            )
+            return True
+        except Exception as exc:
+            logger.error("Failed to launch Chromium: %s", exc)
+            # Do not leak the driver process if launch failed.
+            self._stop_playwright()
+            return False
+
+    def create_context(self, video_dir: str = "outputs/videos") -> bool:
+        """Open a recording context and a page. Returns False on failure."""
+        if not self.browser:
+            logger.error("create_context called before launch_browser")
+            return False
+
+        self._video_dir = Path(video_dir)
+        try:
+            self._video_dir.mkdir(parents=True, exist_ok=True)
             self.context = self.browser.new_context(
-                record_video_dir=video_dir,
-                record_video_size={"width": 1920, "height": 1080},
-                viewport={"width": 1920, "height": 1080},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/131.0.0.0 Safari/537.36"
-                ),
+                record_video_dir=str(self._video_dir),
+                record_video_size=VIEWPORT,
+                viewport=VIEWPORT,
                 locale="en-US",
                 timezone_id="America/New_York",
             )
-            # Hide navigator.webdriver and related automation signals
             self.context.add_init_script(
-                """
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                window.chrome = window.chrome || { runtime: {} };
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                """
+                "Object.defineProperty(navigator, 'webdriver', "
+                "{ get: () => undefined });"
             )
             self.page = self.context.new_page()
-            logger.info(f"Browser context created with video recording to {video_dir}")
+            self.page.set_default_timeout(15000)
+            logger.info("Recording context created (video -> %s)", self._video_dir)
             return True
-        except Exception as e:
-            logger.error(f"Failed to create context: {e}")
+        except Exception as exc:
+            logger.error("Failed to create browser context: %s", exc)
             return False
-    
-    def login(self, url: str, email: str, password: str, wait_time: int = 5000) -> Dict:
-        """
-        Log into NeevCloud portal
-        
-        Args:
-            url: Login page URL
-            email: Login email
-            password: Login password
-            wait_time: Wait time after login in ms
-        """
-        try:
-            logger.info(f"Logging into {url}...")
-            self.navigate(url, wait_time=3000)
-            
-            # Try common login form selectors
-            email_selectors = [
-                'input[type="email"]', 'input[name="email"]',
-                '#email', 'input[placeholder*="email" i]',
-                'input[type="text"]', 'input[name="username"]'
-            ]
-            password_selectors = [
-                'input[type="password"]', 'input[name="password"]',
-                '#password', 'input[placeholder*="password" i]'
-            ]
-            submit_selectors = [
-                'button[type="submit"]', 'input[type="submit"]',
-                'button:has-text("Sign in")', 'button:has-text("Log in")',
-                'button:has-text("Login")', 'button:has-text("Submit")',
-                'button:has-text("sign in")', 'button:has-text("log in")',
-            ]
-            
-            # Fill email
-            email_filled = False
-            for sel in email_selectors:
-                try:
-                    if self.page.locator(sel).count() > 0:
-                        self.page.fill(sel, email)
-                        email_filled = True
-                        logger.info(f"Filled email using: {sel}")
-                        break
-                except:
-                    continue
-            
-            if not email_filled:
-                logger.warning("Could not find email field")
-                return {"action": "login", "status": "failed", "error": "Email field not found"}
-            
-            time.sleep(0.5)
-            
-            # Fill password
-            password_filled = False
-            for sel in password_selectors:
-                try:
-                    if self.page.locator(sel).count() > 0:
-                        self.page.fill(sel, password)
-                        password_filled = True
-                        logger.info(f"Filled password using: {sel}")
-                        break
-                except:
-                    continue
-            
-            if not password_filled:
-                logger.warning("Could not find password field")
-                return {"action": "login", "status": "failed", "error": "Password field not found"}
-            
-            time.sleep(0.5)
-            
-            # Click submit
-            submitted = False
-            for sel in submit_selectors:
-                try:
-                    if self.page.locator(sel).count() > 0:
-                        self.page.click(sel)
-                        submitted = True
-                        logger.info(f"Clicked submit using: {sel}")
-                        break
-                except:
-                    continue
-            
-            if not submitted:
-                # Try pressing Enter as fallback
-                self.page.press('input[type="password"]', 'Enter')
-                logger.info("Pressed Enter to submit")
-            
-            # Wait for navigation after login
+
+    def _stop_playwright(self) -> None:
+        if self.playwright:
             try:
-                self.page.wait_for_load_state("networkidle", timeout=15000)
-            except:
-                pass
-            time.sleep(wait_time / 1000)
-            
-            logger.info("✓ Login completed")
-            log_entry = {
-                "action": "login",
-                "status": "completed",
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            return log_entry
-            
-        except Exception as e:
-            logger.error(f"Login failed: {e}")
-            log_entry = {
-                "action": "login",
-                "status": "failed",
-                "error": str(e),
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            return log_entry
-    
-    def get_video_path(self) -> Optional[str]:
-        """
-        Get the path to Playwright's recorded video.
-        Must be called AFTER closing the context.
-        """
-        try:
-            if self.page:
-                video = self.page.video
-                if video:
-                    path = video.path()
-                    logger.info(f"Playwright video recorded at: {path}")
-                    return str(path)
-        except Exception as e:
-            logger.warning(f"Could not get video path: {e}")
-        return None
-    
-    def navigate(self, url: str, wait_time: int = 5000) -> Dict:
-        """Navigate to URL"""
-        try:
-            self.page.goto(url, wait_until="networkidle", timeout=30000)
-            self.page.wait_for_load_state("networkidle")
-            time.sleep(wait_time / 1000)
-            
-            log_entry = {
-                "action": "navigate",
-                "url": url,
-                "status": "completed",
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            logger.info(f"Navigated to {url}")
-            return log_entry
-        except Exception as e:
-            log_entry = {
-                "action": "navigate",
-                "url": url,
-                "status": "failed",
-                "error": str(e),
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            logger.error(f"Navigation failed: {e}")
-            return log_entry
-    
-    def click(self, selector: str, alt_selectors: Optional[List[str]] = None) -> Dict:
-        """Click element with fallback selectors"""
-        selectors_to_try = [selector] + (alt_selectors or [])
-        
-        for sel in selectors_to_try:
-            try:
-                self.page.click(sel)
-                time.sleep(500 / 1000)
-                
-                log_entry = {
-                    "action": "click",
-                    "selector": sel,
-                    "status": "completed",
-                    "timestamp": time.time()
-                }
-                self.logs.append(log_entry)
-                logger.info(f"Clicked: {sel}")
-                return log_entry
-            except:
-                continue
-        
-        log_entry = {
-            "action": "click",
-            "selector": selector,
-            "status": "failed",
-            "error": f"Element not found with selectors: {selectors_to_try}",
-            "timestamp": time.time()
-        }
-        self.logs.append(log_entry)
-        logger.error(f"Click failed: {selector}")
-        return log_entry
-    
-    def fill(self, selector: str, text: str) -> Dict:
-        """Fill input field"""
-        try:
-            self.page.fill(selector, text)
-            time.sleep(300 / 1000)
-            
-            log_entry = {
-                "action": "fill",
-                "selector": selector,
-                "status": "completed",
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            logger.info(f"Filled: {selector} with text")
-            return log_entry
-        except Exception as e:
-            log_entry = {
-                "action": "fill",
-                "selector": selector,
-                "status": "failed",
-                "error": str(e),
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            logger.error(f"Fill failed: {e}")
-            return log_entry
-    
-    def press(self, key: str) -> Dict:
-        """Press keyboard key"""
-        try:
-            self.page.press("body", key)
-            time.sleep(1000 / 1000)
-            
-            log_entry = {
-                "action": "press",
-                "key": key,
-                "status": "completed",
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            logger.info(f"Pressed: {key}")
-            return log_entry
-        except Exception as e:
-            log_entry = {
-                "action": "press",
-                "key": key,
-                "status": "failed",
-                "error": str(e),
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            logger.error(f"Press failed: {e}")
-            return log_entry
-    
-    def scroll(self, direction: str = "down", amount: int = 3) -> Dict:
-        """Scroll page"""
-        try:
-            if direction == "down":
-                self.page.evaluate(f"window.scrollBy(0, {amount * 100})")
-            else:
-                self.page.evaluate(f"window.scrollBy(0, {-amount * 100})")
-            
-            time.sleep(1000 / 1000)
-            
-            log_entry = {
-                "action": "scroll",
-                "direction": direction,
-                "amount": amount,
-                "status": "completed",
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            return log_entry
-        except Exception as e:
-            log_entry = {
-                "action": "scroll",
-                "status": "failed",
-                "error": str(e),
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            return log_entry
-    
-    def wait(self, milliseconds: int) -> Dict:
-        """Wait for specified time"""
-        time.sleep(milliseconds / 1000)
-        log_entry = {
-            "action": "wait",
-            "duration_ms": milliseconds,
-            "status": "completed",
-            "timestamp": time.time()
-        }
-        self.logs.append(log_entry)
-        return log_entry
-    
-    def screenshot(self, filename: str) -> Dict:
-        """Take screenshot"""
-        try:
-            output_path = Path("outputs") / filename
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            self.page.screenshot(path=str(output_path))
-            
-            log_entry = {
-                "action": "screenshot",
-                "filename": filename,
-                "status": "completed",
-                "path": str(output_path),
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            return log_entry
-        except Exception as e:
-            log_entry = {
-                "action": "screenshot",
-                "status": "failed",
-                "error": str(e),
-                "timestamp": time.time()
-            }
-            self.logs.append(log_entry)
-            return log_entry
-    
-    def execute_script(self, script: str):
-        """Execute JavaScript"""
-        try:
-            return self.page.evaluate(script)
-        except Exception as e:
-            logger.error(f"Script execution failed: {e}")
-            return None
-    
-    def get_video_path(self) -> Optional[str]:
-        """Get the path to the recorded video for the current page"""
-        if self.page:
-            try:
-                if self.page.video:
-                    return self.page.video.path()
-            except Exception as e:
-                import logging
-                logging.getLogger(__name__).warning(f"Failed to get video path: {e}")
-        return None
-        
-    def close(self):
-        """Close browser and finalize video recording"""
-        try:
-            # Brief wait to ensure the final frame is recorded
-            import time
-            time.sleep(1.0)
-            
-            video = self.page.video if hasattr(self, 'page') and self.page else None
-            
-            if hasattr(self, 'context') and self.context:
-                self.context.close()
-            if hasattr(self, 'browser') and self.browser:
-                self.browser.close()
-            if hasattr(self, 'playwright') and self.playwright:
                 self.playwright.stop()
-                
-            if video:
-                try:
-                    self._recorded_video_path = video.path()
-                except Exception as e:
-                    import logging
-                    logging.getLogger(__name__).warning(f"Failed to get video path after close: {e}")
-                    
-            import logging
-            logging.getLogger(__name__).info("Browser closed")
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Error closing browser: {e}")
+            except Exception as exc:
+                logger.warning("Playwright stop failed: %s", exc)
+            finally:
+                self.playwright = None
+
+    def close(self) -> Optional[str]:
+        """Tear down browser + driver and finalize the recording.
+
+        Each stage runs in its own try/finally so a failure in one does not
+        orphan a Chromium or driver process. Returns the recorded video path.
+        """
+        video = None
+        try:
+            if self.page and not self.page.is_closed():
+                video = self.page.video
+                # Let the encoder flush the last frame.
+                time.sleep(1.0)
+        except Exception as exc:
+            logger.warning("Could not access page video handle: %s", exc)
+
+        try:
+            if self.context:
+                # Closing the context is what flushes the .webm to disk.
+                self.context.close()
+        except Exception as exc:
+            logger.warning("Context close failed: %s", exc)
+        finally:
+            self.context = None
+            try:
+                if self.browser:
+                    self.browser.close()
+            except Exception as exc:
+                logger.warning("Browser close failed: %s", exc)
+            finally:
+                self.browser = None
+                self._stop_playwright()
+
+        if video is not None:
+            try:
+                self._recorded_video_path = str(video.path())
+            except Exception as exc:
+                logger.warning("Video path unavailable after close: %s", exc)
+
+        if not self._recorded_video_path:
+            self._recorded_video_path = self._find_recorded_video()
+
+        self.page = None
+        logger.info("Browser closed (video=%s)", self._recorded_video_path)
+        return self._recorded_video_path
+
+    def _find_recorded_video(self) -> Optional[str]:
+        """Fallback: newest non-empty video Playwright wrote to the video dir."""
+        if not self._video_dir or not self._video_dir.is_dir():
+            return None
+        clips = [
+            p
+            for pattern in ("*.webm", "*.mp4")
+            for p in self._video_dir.glob(pattern)
+            if p.is_file() and p.stat().st_size > 0
+        ]
+        if not clips:
+            return None
+        return str(max(clips, key=lambda p: p.stat().st_mtime))
+
     @property
     def recorded_video_path(self) -> Optional[str]:
-        """Get the recorded video path (available after close)"""
-        return getattr(self, '_recorded_video_path', None)
-    
-    def get_logs(self) -> List[Dict]:
-        """Get all execution logs"""
-        return self.logs
-    
-    def __enter__(self):
-        """Context manager entry"""
-        self.launch_browser()
-        self.create_context()
+        """Recorded video path. Only populated after :meth:`close`."""
+        return self._recorded_video_path
+
+    def __enter__(self) -> "PlaywrightEngine":
+        if not self.launch_browser():
+            raise RuntimeError("Chromium failed to launch")
+        if not self.create_context():
+            self.close()
+            raise RuntimeError("Browser context failed to open")
         return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()
+
+    # ------------------------------------------------------------------
+    # pacing
+    # ------------------------------------------------------------------
+    def record_hold(self, seconds: float) -> float:
+        """Hold the current view on screen for ``seconds``.
+
+        Playwright records in real time, so holding is a plain sleep -- the
+        browser encodes those frames for us. Returns the seconds held so the
+        caller can build a wall-clock timeline.
+        """
+        duration = max(0.0, float(seconds or 0.0))
+        if duration:
+            time.sleep(duration)
+        return duration
+
+    def snapshot_frame(self) -> None:
+        """No-op. Kept so callers written against the old screenshot-loop
+        recorder keep working; native recording needs no manual frames."""
+        return None
+
+    # ------------------------------------------------------------------
+    # navigation
+    # ------------------------------------------------------------------
+    def navigate(self, url: str, wait_time: int = 2000) -> Dict:
+        """Navigate to ``url``. Rejects non-http(s) schemes."""
+        if not _is_navigable(url):
+            logger.error("Refusing to navigate to unsupported URL: %r", url)
+            return self._log(
+                "navigate", "failed", url=url,
+                error=f"Blocked URL scheme (only http/https allowed): {url}",
+            )
+        try:
+            self.page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                self.page.wait_for_load_state("networkidle", timeout=10000)
+            except PlaywrightTimeoutError:
+                # Long-polling / analytics pages never go idle. Not an error.
+                logger.debug("networkidle not reached for %s; continuing", url)
+            time.sleep(max(0, wait_time) / 1000)
+            logger.info("Navigated to %s", url)
+            return self._log("navigate", "completed", url=url)
+        except Exception as exc:
+            logger.error("Navigation to %s failed: %s", url, exc)
+            return self._log("navigate", "failed", url=url, error=str(exc))
+
+    def login(self, url: str, email: str, password: str, wait_time: int = 5000) -> Dict:
+        """Fill and submit a login form.
+
+        Reports ``failed`` unless the email field, the password field, AND a
+        submit path all actually succeeded -- a login that quietly did nothing
+        must not read as success, or the pipeline records a demo of the
+        logged-out page and calls it a pass.
+        """
+        nav = self.navigate(url, wait_time=1500)
+        if nav.get("status") != "completed":
+            return self._log("login", "failed", error=nav.get("error", "Navigation failed"))
+
+        email_selectors = [
+            'input[type="email"]', 'input[name="email"]', "#email",
+            'input[placeholder*="email" i]', 'input[name="username"]',
+        ]
+        password_selectors = [
+            'input[type="password"]', 'input[name="password"]', "#password",
+            'input[placeholder*="password" i]',
+        ]
+        submit_selectors = [
+            'button[type="submit"]', 'input[type="submit"]',
+            'button:has-text("Sign in")', 'button:has-text("Log in")',
+            'button:has-text("Login")', 'button:has-text("Submit")',
+        ]
+
+        filled_email = self._fill_first(email_selectors, email, "email")
+        if not filled_email:
+            return self._log("login", "failed", error="Email field not found")
+
+        filled_password = self._fill_first(password_selectors, password, "password")
+        if not filled_password:
+            return self._log("login", "failed", error="Password field not found")
+
+        if not self._submit_login(submit_selectors, filled_password):
+            return self._log("login", "failed", error="Could not submit the login form")
+
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=15000)
+        except PlaywrightTimeoutError:
+            logger.debug("No networkidle after login submit; continuing")
+        time.sleep(max(0, wait_time) / 1000)
+        logger.info("Login submitted for %s", url)
+        return self._log("login", "completed", url=url)
+
+    def _fill_first(self, selectors: List[str], value: str, label: str) -> Optional[str]:
+        """Fill the first selector that resolves to a visible field.
+
+        Returns the selector that worked, or None. Never logs ``value``.
+        """
+        for selector in selectors:
+            try:
+                field = self.page.locator(selector).first
+                if field.count() == 0:
+                    continue
+                field.fill(value, timeout=5000)
+                logger.info("Filled %s field via %s", label, selector)
+                return selector
+            except (PlaywrightError, PlaywrightTimeoutError) as exc:
+                logger.debug("%s selector %s did not work: %s", label, selector, exc)
+        return None
+
+    def _submit_login(self, submit_selectors: List[str], password_selector: str) -> bool:
+        """Click a submit control, falling back to Enter in the password field."""
+        for selector in submit_selectors:
+            try:
+                button = self.page.locator(selector).first
+                if button.count() == 0:
+                    continue
+                button.click(timeout=5000)
+                logger.info("Submitted login via %s", selector)
+                return True
+            except (PlaywrightError, PlaywrightTimeoutError) as exc:
+                logger.debug("Submit selector %s did not work: %s", selector, exc)
+
+        try:
+            self.page.press(password_selector, "Enter")
+            logger.info("Submitted login by pressing Enter in %s", password_selector)
+            return True
+        except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            logger.warning("Enter-to-submit fallback failed: %s", exc)
+            return False
+
+    # ------------------------------------------------------------------
+    # interactions
+    # ------------------------------------------------------------------
+    def click(self, selector: str, alt_selectors: Optional[List[str]] = None) -> Dict:
+        """Click the first selector that resolves. Scrolls into view first."""
+        attempted = [selector] + list(alt_selectors or [])
+        errors = []
+        for sel in attempted:
+            if not sel:
+                continue
+            try:
+                target = self.page.locator(sel).first
+                target.scroll_into_view_if_needed(timeout=5000)
+                target.click(timeout=8000)
+                logger.info("Clicked %s", sel)
+                return self._log("click", "completed", selector=sel)
+            except (PlaywrightError, PlaywrightTimeoutError) as exc:
+                errors.append(f"{sel}: {type(exc).__name__}")
+                logger.debug("Click on %s failed: %s", sel, exc)
+        logger.error("Click failed for all selectors: %s", attempted)
+        return self._log(
+            "click", "failed", selector=selector,
+            error="No clickable element for " + "; ".join(errors),
+        )
+
+    def fill(self, selector: str, text: str) -> Dict:
+        """Type ``text`` into ``selector``."""
+        try:
+            field = self.page.locator(selector).first
+            field.scroll_into_view_if_needed(timeout=5000)
+            field.fill(text, timeout=8000)
+            logger.info("Filled %s", selector)
+            return self._log("fill", "completed", selector=selector)
+        except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            logger.error("Fill on %s failed: %s", selector, exc)
+            return self._log("fill", "failed", selector=selector, error=str(exc))
+
+    # Playwright key names; the LLM tends to emit shouty variants.
+    _KEY_ALIASES = {
+        "ENTER": "Enter", "RETURN": "Enter", "TAB": "Tab", "ESC": "Escape",
+        "ESCAPE": "Escape", "SPACE": " ", "BACKSPACE": "Backspace",
+        "DELETE": "Delete", "ARROWDOWN": "ArrowDown", "ARROWUP": "ArrowUp",
+        "PAGEDOWN": "PageDown", "PAGEUP": "PageUp", "HOME": "Home", "END": "End",
+    }
+
+    def press(self, selector: Optional[str], key: str) -> Dict:
+        """Press ``key``, scoped to ``selector`` when one is given.
+
+        Unlike the old engine this never silently types the literal word
+        "PAGEDOWN" when a key name is unrecognised -- unmapped names go to
+        Playwright as-is and a genuine failure is reported as failed.
+        """
+        resolved = self._KEY_ALIASES.get(str(key).strip().upper(), str(key).strip())
+        try:
+            if selector:
+                self.page.locator(selector).first.press(resolved, timeout=8000)
+            else:
+                self.page.keyboard.press(resolved)
+            logger.info("Pressed %s%s", resolved, f" on {selector}" if selector else "")
+            return self._log("press", "completed", selector=selector, key=resolved)
+        except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            logger.error("Press %s failed: %s", resolved, exc)
+            return self._log(
+                "press", "failed", selector=selector, key=resolved, error=str(exc)
+            )
+
+    def select_option(
+        self,
+        selector: str,
+        value: Optional[str] = None,
+        index: Optional[int] = None,
+        label: Optional[str] = None,
+    ) -> Dict:
+        """Choose an option in a <select>.
+
+        Clicking an <option> node does not work in Chromium, which is why the
+        old code path for dropdowns silently did nothing.
+        """
+        try:
+            dropdown = self.page.locator(selector).first
+            dropdown.scroll_into_view_if_needed(timeout=5000)
+            if index is not None:
+                dropdown.select_option(index=int(index), timeout=8000)
+            elif label is not None:
+                dropdown.select_option(label=str(label), timeout=8000)
+            else:
+                dropdown.select_option(str(value), timeout=8000)
+            logger.info("Selected option in %s", selector)
+            return self._log("select", "completed", selector=selector, value=value)
+        except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            logger.error("Select on %s failed: %s", selector, exc)
+            return self._log("select", "failed", selector=selector, error=str(exc))
+
+    def hover(self, selector: str) -> Dict:
+        """Hover over an element (reveals menus, tooltips)."""
+        try:
+            target = self.page.locator(selector).first
+            target.scroll_into_view_if_needed(timeout=5000)
+            target.hover(timeout=8000)
+            logger.info("Hovered %s", selector)
+            return self._log("hover", "completed", selector=selector)
+        except (PlaywrightError, PlaywrightTimeoutError) as exc:
+            logger.error("Hover on %s failed: %s", selector, exc)
+            return self._log("hover", "failed", selector=selector, error=str(exc))
+
+    def scroll(self, direction: str = "down", amount: int = 500) -> Dict:
+        """Smooth-scroll the window by ``amount`` pixels."""
+        try:
+            pixels = int(amount)
+        except (TypeError, ValueError):
+            pixels = 500
+        if str(direction).lower() == "up":
+            pixels = -abs(pixels)
+        try:
+            self.page.evaluate(
+                "px => window.scrollBy({ top: px, behavior: 'smooth' })", pixels
+            )
+            time.sleep(0.6)
+            return self._log("scroll", "completed", direction=direction, amount=pixels)
+        except Exception as exc:
+            logger.error("Scroll failed: %s", exc)
+            return self._log("scroll", "failed", error=str(exc))
+
+    def wait(self, milliseconds: int) -> Dict:
+        time.sleep(max(0, int(milliseconds)) / 1000)
+        return self._log("wait", "completed", duration_ms=milliseconds)
+
+    def execute_script(self, script: str, arg=None):
+        """Evaluate JS in the page. Returns None and logs on failure."""
+        try:
+            return self.page.evaluate(script, arg) if arg is not None \
+                else self.page.evaluate(script)
+        except Exception as exc:
+            logger.warning("Script evaluation failed: %s", exc)
+            return None
+
+    # ------------------------------------------------------------------
+    # diagnostics
+    # ------------------------------------------------------------------
+    def capture_screenshot(self, path: str) -> Dict:
+        """Save a screenshot to an explicit path (callers pass the session dir)."""
+        try:
+            destination = Path(path)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            self.page.screenshot(path=str(destination))
+            return self._log("screenshot", "completed", path=str(destination))
+        except Exception as exc:
+            logger.warning("Screenshot to %s failed: %s", path, exc)
+            return self._log("screenshot", "failed", path=str(path), error=str(exc))
+
+    # Backwards-compatible alias.
+    def screenshot(self, path: str) -> Dict:
+        return self.capture_screenshot(path)
+
+    def wait_for_bot_challenge(self, timeout: int = 90) -> Dict:
+        """Wait out an interstitial bot wall, if one is showing.
+
+        Detection is title-only and returns immediately when the title looks
+        normal, so ordinary pages cost nothing. The old implementation
+        substring-matched 80KB of raw HTML and stalled for 90s on any page
+        whose markup merely contained the word "verification".
+        """
+        deadline = time.time() + max(0, timeout)
+        seen = False
+        while True:
+            try:
+                title = (self.page.title() or "").lower()
+            except Exception:
+                return self._log("bot_challenge", "completed", detected=False)
+
+            if not any(marker in title for marker in BOT_CHALLENGE_TITLES):
+                return self._log("bot_challenge", "completed", detected=seen)
+
+            seen = True
+            if time.time() >= deadline:
+                logger.error("Bot challenge still present after %ss: %r", timeout, title)
+                return self._log(
+                    "bot_challenge", "blocked",
+                    error=f"Bot challenge did not clear within {timeout}s (title: {title!r})",
+                )
+            logger.info("Bot challenge detected (%r); waiting...", title)
+            time.sleep(2.0)
+
+    _DOM_SUMMARY_JS = """
+    () => {
+      const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 2 || r.height < 2) return false;
+        const s = getComputedStyle(el);
+        return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+      };
+      const ref = (el) => {
+        if (el.id) return '#' + CSS.escape(el.id);
+        if (el.name) return el.tagName.toLowerCase() + '[name="' + el.name + '"]';
+        const c = (el.getAttribute('class') || '').trim().split(/\\s+/)[0];
+        return c ? el.tagName.toLowerCase() + '.' + CSS.escape(c)
+                 : el.tagName.toLowerCase();
+      };
+      const out = [];
+      const nodes = document.querySelectorAll(
+        'a[href], button, input, select, textarea, [role="button"], h1, h2, h3'
+      );
+      for (const el of nodes) {
+        if (out.length >= 60) break;
+        if (!visible(el)) continue;
+        const tag = el.tagName.toLowerCase();
+        const text = (el.innerText || el.value || el.placeholder || '')
+          .trim().replace(/\\s+/g, ' ').slice(0, 60);
+        out.push({ tag, text, selector: ref(el),
+                   type: el.getAttribute('type') || '' });
+      }
+      return out;
+    }
+    """
+
+    def get_dom_summary(self) -> str:
+        """Compact, token-efficient listing of visible interactive elements.
+
+        Feeds the LLM re-planner selectors that actually exist on the live page.
+        """
+        elements = self.execute_script(self._DOM_SUMMARY_JS)
+        if not elements:
+            return ""
+        lines = []
+        for el in elements:
+            label = f' "{el["text"]}"' if el.get("text") else ""
+            kind = f' type={el["type"]}' if el.get("type") else ""
+            lines.append(f'{el["tag"]}{label}{kind} -> {el["selector"]}')
+        return "\n".join(lines)

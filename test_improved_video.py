@@ -1,93 +1,52 @@
-"""Test the improved video generation pipeline"""
-import socket
-import time
-from urllib.parse import urlparse
+"""End-to-end test: generate a demo video and download it.
 
-import pytest
+/generate is synchronous -- it returns only after the pipeline has finished --
+so there is nothing to poll for. Requires a running server (see conftest.py).
+"""
+
 import requests
 
-BASE_URL = "http://localhost:8000/api"
+PROMPT = (
+    "Demonstrate how to create a new project on the GPU console. Show the steps: "
+    "open the new project panel, fill in the project name, choose a workspace "
+    "tier, and submit the form."
+)
 
 
-def _require_service(base_url: str) -> None:
-    parsed = urlparse(base_url)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    try:
-        with socket.create_connection((host, port), timeout=2):
-            return
-    except OSError:
-        pytest.skip(f"Integration service unavailable at {host}:{port}")
-
-
-def test_video_generation(tmp_path):
-    """Generate a demo video and check the output"""
-    _require_service(BASE_URL)
-    
-    # Test prompt for creating a project on NeevCloud
-    prompt = "Demonstrate how to create a new project on NeevCloud. Show all the steps including navigating to the projects section, clicking the new project button, filling in the project details, and confirming the creation."
-    
-    print("\n" + "="*60)
-    print("Testing Improved Video Generation")
-    print("="*60)
-    print(f"\nPrompt: {prompt}\n")
-    
-    # Step 1: Generate demo
-    print("Generating demo...")
+def test_end_to_end_video_generation(live_api: str, tmp_path) -> None:
     response = requests.post(
-        f"{BASE_URL}/generate",
-        json={
-            "prompt": prompt,
-            "language": "en"
-        }
+        f"{live_api}/generate",
+        json={"prompt": PROMPT, "language": "en", "allow_partial": True},
+        # The whole pipeline (browser + narration + compose) runs inline.
+        timeout=600,
     )
     assert response.status_code == 200, response.text
-    
+
     result = response.json()
     session_id = result.get("session_id")
-    
-    print(f"✅ Demo generation started")
-    print(f"   Session ID: {session_id}")
-    print(f"   Status: {result.get('status')}")
-    
-    # Wait for generation to complete
-    print("\nWaiting for video to generate...")
-    time.sleep(10)
-    
-    # Step 2: Get video info
-    print("\nFetching video metadata...")
-    response = requests.get(f"{BASE_URL}/videos/{session_id}")
-    assert response.status_code == 200, response.text
+    assert session_id, f"No session_id in response: {result}"
+    # "partial" is expected when no LLM key is configured: the recording still
+    # exists, only some planned actions were skipped.
+    assert result["status"] in {"completed", "partial"}, result
 
-    video_info = response.json()
-    print(f"✅ Video metadata retrieved:")
-    print(f"   Status: {video_info.get('status')}")
-    print(f"   Duration: {video_info.get('duration')} seconds")
-    print(f"   File size: {video_info.get('file_size')} bytes")
-    print(f"   Has video: {video_info.get('has_video')}")
-    print(f"   Video path: {video_info.get('video_path')}")
+    meta = requests.get(f"{live_api}/videos/{session_id}", timeout=30)
+    assert meta.status_code == 200, meta.text
+    video_info = meta.json()
 
     if not video_info.get("has_video"):
-        pytest.skip("Generation completed but no downloadable video was produced")
-    
-    # Step 3: Try to download the video
-    print("\nDownloading video...")
-    response = requests.get(f"{BASE_URL}/download/{session_id}")
-    assert response.status_code == 200, response.text
+        raise AssertionError(
+            f"Pipeline reported {result['status']} but produced no playable file. "
+            f"metadata={video_info}"
+        )
 
-    download_path = tmp_path / f"test_demo_{session_id}.mp4"
-    with open(download_path, "wb") as f:
-        f.write(response.content)
-    print(f"✅ Video downloaded successfully!")
-    print(f"   Size: {len(response.content)} bytes")
-    print(f"   Local path: {download_path}")
+    download = requests.get(f"{live_api}/download/{session_id}", timeout=120)
+    assert download.status_code == 200, download.text
 
-    assert download_path.exists()
-    assert download_path.stat().st_size > 0
-    
-    print("\n" + "="*60)
-    print("Test complete!")
-    print("="*60 + "\n")
-
-if __name__ == "__main__":
-    test_video_generation()
+    path = tmp_path / f"demo_{session_id}.mp4"
+    path.write_bytes(download.content)
+    assert path.stat().st_size > 0, "Downloaded video file is empty"
+    print(
+        f"\nsession={session_id} status={result['status']} "
+        f"duration={video_info.get('duration')}s "
+        f"size={path.stat().st_size} bytes -> {path}"
+    )
